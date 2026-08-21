@@ -52,8 +52,19 @@ def resolve_api_key(target_dir: Optional[Path] = None) -> Optional[str]:
         if os.environ.get(env_var):
             return os.environ[env_var]
 
-    script_dir = Path(__file__).resolve().parent
+    if getattr(sys, 'frozen', False):
+        script_dir = Path(sys.executable).resolve().parent
+    else:
+        script_dir = Path(__file__).resolve().parent
     search_paths = [script_dir]
+    search_paths.extend(script_dir.parents)
+    try:
+        if script_dir.parent.exists():
+            for sib in script_dir.parent.iterdir():
+                if sib.is_dir():
+                    search_paths.append(sib)
+    except Exception:
+        pass
 
     if target_dir:
         search_paths.append(target_dir)
@@ -127,22 +138,65 @@ class CandidateEvaluation(BaseModel):
 # ---------------------------------------------------------------------------
 # File Text Extraction Utilities
 # ---------------------------------------------------------------------------
-def extract_text_from_pdf(filepath: Path) -> str:
-    """Extract text from PDF file using pypdf."""
+def extract_text_from_pdf(filepath: Path) -> tuple[str, bool, Optional[bytes]]:
+    """
+    Extract text from PDF file using pypdf.
+    Returns tuple: (extracted_text, is_scanned_pdf, raw_bytes)
+    Handles zero-byte PDFs, encrypted PDFs, and scanned image PDFs.
+    """
+    if not filepath.exists():
+        print(f"  [Warning] File '{filepath.name}' does not exist.")
+        return "", False, None
+
+    file_size = filepath.stat().st_size
+    if file_size == 0:
+        print(f"  [Warning] PDF file '{filepath.name}' is 0 bytes (zero-byte file).")
+        return "[Warning: Zero-byte PDF file - empty content]", False, None
+
+    raw_bytes = None
+    try:
+        raw_bytes = filepath.read_bytes()
+    except Exception as e:
+        print(f"  [Warning] Could not read bytes of PDF '{filepath.name}': {e}")
+
     text_chunks = []
     try:
         reader = pypdf.PdfReader(str(filepath))
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                text_chunks.append(t)
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")
+            except Exception:
+                pass
+
+        for page_idx, page in enumerate(reader.pages):
+            try:
+                t = page.extract_text()
+                if t:
+                    text_chunks.append(t.strip())
+            except Exception as pe:
+                print(f"  [Warning] Page {page_idx+1} text extraction failed in '{filepath.name}': {pe}")
     except Exception as e:
-        print(f"  [Warning] Error reading PDF '{filepath.name}': {e}")
-    return "\n".join(text_chunks)
+        print(f"  [Warning] Error parsing PDF structure '{filepath.name}': {e}")
+
+    full_text = "\n".join(text_chunks).strip()
+
+    # Detect Scanned / Image-only PDF (file size > 2KB but extracted text is minimal/empty)
+    is_scanned = False
+    if file_size > 2048 and len(full_text) < 30:
+        is_scanned = True
+        print(f"  [Notice] Scanned/Image PDF detected: '{filepath.name}' ({file_size} bytes). Multimodal GenAI OCR active.")
+        if not full_text:
+            full_text = f"[Scanned/Image PDF Document: '{filepath.name}' - Native Multimodal GenAI OCR active]"
+
+    return full_text, is_scanned, raw_bytes
 
 
 def extract_text_from_docx(filepath: Path) -> str:
     """Extract text from Word DOCX file using python-docx."""
+    if not filepath.exists() or filepath.stat().st_size == 0:
+        print(f"  [Warning] DOCX file '{filepath.name}' is missing or 0 bytes.")
+        return ""
+
     text_chunks = []
     try:
         doc = docx.Document(str(filepath))
@@ -160,8 +214,12 @@ def extract_text_from_docx(filepath: Path) -> str:
 
 
 def extract_text_from_txt(filepath: Path) -> str:
-    """Extract text from plain text file."""
-    for encoding in ["utf-8", "utf-8-sig", "cp1252", "latin-1"]:
+    """Extract text from plain text file with multi-encoding fallback."""
+    if not filepath.exists() or filepath.stat().st_size == 0:
+        print(f"  [Warning] TXT file '{filepath.name}' is missing or 0 bytes.")
+        return ""
+
+    for encoding in ["utf-8", "utf-8-sig", "cp1252", "latin-1", "tis-620", "utf-16"]:
         try:
             return filepath.read_text(encoding=encoding)
         except Exception:
@@ -169,20 +227,53 @@ def extract_text_from_txt(filepath: Path) -> str:
     return ""
 
 
-def extract_file_text(filepath: Path) -> str:
-    """Extract raw text from supported document formats."""
+def extract_file_info(filepath: Path) -> Dict[str, Any]:
+    """
+    Extract text and file metadata from supported document formats (.pdf, .docx, .doc, .txt, .md).
+    Returns dict: {"text": str, "is_scanned": bool, "raw_bytes": bytes, "extension": str}
+    """
     ext = filepath.suffix.lower()
     if ext == ".pdf":
-        return extract_text_from_pdf(filepath)
+        text, is_scanned, raw_bytes = extract_text_from_pdf(filepath)
+        return {
+            "text": text,
+            "is_scanned": is_scanned,
+            "raw_bytes": raw_bytes,
+            "extension": ext
+        }
     elif ext in [".docx", ".doc"]:
-        return extract_text_from_docx(filepath)
+        text = extract_text_from_docx(filepath)
+        return {
+            "text": text,
+            "is_scanned": False,
+            "raw_bytes": None,
+            "extension": ext
+        }
     elif ext in [".txt", ".md"]:
-        return extract_text_from_txt(filepath)
-    return ""
+        text = extract_text_from_txt(filepath)
+        return {
+            "text": text,
+            "is_scanned": False,
+            "raw_bytes": None,
+            "extension": ext
+        }
+    return {
+        "text": "",
+        "is_scanned": False,
+        "raw_bytes": None,
+        "extension": ext
+    }
+
+
+def extract_file_text(filepath: Path) -> str:
+    """Extract raw text from supported document formats."""
+    return extract_file_info(filepath)["text"]
 
 
 def is_placeholder_file(filepath: Path) -> bool:
-    """Check if file is a placeholder file based on filename or tiny size."""
+    """Check if file is a placeholder file based on filename or zero/tiny size."""
+    if filepath.stat().st_size == 0:
+        return True
     name_lower = filepath.name.lower()
     if any(p in name_lower for p in ["placeholder", "วางไฟล์", "โยนไฟล์", "00_place"]):
         return True
@@ -194,10 +285,10 @@ def is_placeholder_file(filepath: Path) -> bool:
 # ---------------------------------------------------------------------------
 # Job Description & Candidate CV Loaders
 # ---------------------------------------------------------------------------
-def find_and_read_job_description(target_dir: Path) -> tuple[Optional[Path], str]:
+def find_and_read_job_description(target_dir: Path) -> tuple[Optional[Path], Dict[str, Any]]:
     """
     Search for Job Description in target folder:
-    1. Check `jd/` subfolder first.
+    1. Check `jd/` subfolder first (scanning direct files and subfolders inside `jd/`).
     2. Fallback to target_dir root if `jd/` subfolder is not present or has no valid files.
     """
     excluded_names = {
@@ -205,17 +296,19 @@ def find_and_read_job_description(target_dir: Path) -> tuple[Optional[Path], str
         "run_screening.bat", "screener_core.py", "requirements.txt"
     }
 
-    supported_extensions = {".pdf", ".docx", ".doc", ".txt"}
+    supported_extensions = {".pdf", ".docx", ".doc", ".txt", ".md"}
     
     # 1. Search in jd/ subfolder
     jd_subfolder = target_dir / "jd"
     candidate_files = []
     
     if jd_subfolder.exists() and jd_subfolder.is_dir():
-        candidate_files = [
-            f for f in jd_subfolder.iterdir()
-            if f.is_file() and f.suffix.lower() in supported_extensions and not is_placeholder_file(f)
-        ]
+        for root, dirs, files in os.walk(jd_subfolder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for file_name in files:
+                file_path = Path(root) / file_name
+                if file_path.suffix.lower() in supported_extensions and not is_placeholder_file(file_path):
+                    candidate_files.append(file_path)
         
     # 2. Fallback to target_dir root if jd/ has no valid files
     if not candidate_files:
@@ -225,7 +318,7 @@ def find_and_read_job_description(target_dir: Path) -> tuple[Optional[Path], str
         ]
 
     if not candidate_files:
-        return None, ""
+        return None, {"text": "", "is_scanned": False, "raw_bytes": None, "extension": ""}
 
     # Prioritize files with jd / job / description in name
     jd_file = None
@@ -238,17 +331,18 @@ def find_and_read_job_description(target_dir: Path) -> tuple[Optional[Path], str
     if not jd_file:
         jd_file = candidate_files[0]
 
-    text = extract_file_text(jd_file)
-    return jd_file, text
+    jd_info = extract_file_info(jd_file)
+    return jd_file, jd_info
 
 
 def find_and_read_candidate_cvs(target_dir: Path) -> List[Dict[str, Any]]:
     """
-    Recursively scan subdirectories for candidate CV files (.pdf, .docx, .txt).
-    Checks `cv/` subfolder first, or fallbacks to any subdirectories.
+    Recursively scan subdirectories for candidate CV files (.pdf, .docx, .txt, .md).
+    Checks `cv/` subfolder first (scanning direct files and subfolders inside `cv/`),
+    or fallbacks to any subdirectories of target_dir.
     Excludes placeholder files.
     """
-    supported_extensions = {".pdf", ".docx", ".doc", ".txt"}
+    supported_extensions = {".pdf", ".docx", ".doc", ".txt", ".md"}
     cv_list = []
 
     # Check if cv/ subfolder exists
@@ -267,13 +361,17 @@ def find_and_read_candidate_cvs(target_dir: Path) -> List[Dict[str, Any]]:
             file_path = current_path / file_name
             if file_path.suffix.lower() in supported_extensions and not is_placeholder_file(file_path):
                 rel_path = file_path.relative_to(target_dir)
-                cv_text = extract_file_text(file_path)
-                if cv_text.strip():
+                file_info = extract_file_info(file_path)
+                cv_text = file_info["text"]
+                if cv_text.strip() or file_info["is_scanned"] or file_info["raw_bytes"]:
                     cv_list.append({
                         "abs_path": file_path,
                         "rel_path": str(rel_path).replace("\\", "/"),
                         "filename": file_name,
-                        "text": cv_text
+                        "text": cv_text,
+                        "is_scanned": file_info["is_scanned"],
+                        "raw_bytes": file_info["raw_bytes"],
+                        "extension": file_info["extension"]
                     })
                 else:
                     print(f"  [Warning] Skipping empty CV: {rel_path}")
@@ -284,8 +382,8 @@ def find_and_read_candidate_cvs(target_dir: Path) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Gemini AI Evaluation Engine
 # ---------------------------------------------------------------------------
-def evaluate_cv_against_jd(client: genai.Client, jd_text: str, cv_item: Dict[str, Any]) -> Dict[str, Any]:
-    """Invoke gemini-2.5-flash with structured JSON response schema."""
+def evaluate_cv_against_jd(client: genai.Client, jd_text: str, cv_item: Dict[str, Any], jd_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Invoke gemini-2.5-flash with structured JSON response schema, supporting multimodal PDF fallback."""
     prompt = f"""
 You are an expert Senior HR Recruiter and Talent Acquisition Specialist.
 Evaluate the candidate CV against the target Job Description (JD).
@@ -310,9 +408,25 @@ Evaluate the candidate CV against the target Job Description (JD).
 7. Provide a 2-3 sentence executive recommendation summary.
 """
 
+    contents: List[Any] = [prompt]
+
+    # Multimodal Fallback: Attach raw PDF bytes if candidate CV is scanned / image PDF
+    if cv_item.get("raw_bytes") and (cv_item.get("is_scanned") or cv_item.get("extension") == ".pdf"):
+        if cv_item.get("is_scanned") or not cv_item.get("text", "").strip() or len(cv_item.get("text", "")) < 100:
+            contents.append(
+                types.Part.from_bytes(data=cv_item["raw_bytes"], mime_type="application/pdf")
+            )
+
+    # Attach raw PDF bytes if JD is scanned / image PDF
+    if jd_info and jd_info.get("raw_bytes") and (jd_info.get("is_scanned") or jd_info.get("extension") == ".pdf"):
+        if jd_info.get("is_scanned") or not jd_text.strip() or len(jd_text) < 100:
+            contents.append(
+                types.Part.from_bytes(data=jd_info["raw_bytes"], mime_type="application/pdf")
+            )
+
     response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=prompt,
+        contents=contents,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=CandidateEvaluation,
@@ -885,8 +999,9 @@ def main():
         sys.exit(1)
         
     # 1. Read Job Description
-    jd_path, jd_text = find_and_read_job_description(target_dir)
-    if not jd_path or not jd_text.strip():
+    jd_path, jd_info = find_and_read_job_description(target_dir)
+    jd_text = jd_info.get("text", "")
+    if not jd_path or (not jd_text.strip() and not jd_info.get("raw_bytes")):
         print(f"❌ Error: No valid Job Description (PDF/DOCX/TXT) found in target folder: {target_dir}")
         sys.exit(1)
     print(f"✔ Job Description Loaded: '{jd_path.relative_to(target_dir)}' ({len(jd_text)} characters)")
@@ -912,7 +1027,7 @@ def main():
     for idx, cv in enumerate(cv_items, 1):
         print(f"  [{idx}/{len(cv_items)}] Evaluating candidate CV: {cv['rel_path']}...")
         try:
-            eval_data = evaluate_cv_against_jd(client, jd_text, cv)
+            eval_data = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
             evaluations.append(eval_data)
             print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']}")
         except Exception as e:
