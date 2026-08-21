@@ -47,7 +47,36 @@ workspace/
 
 ---
 
-## 📊 3. Output Reports Explanation
+## 🎯 3. HR Scoring & Evaluation Framework (UK International School Standard)
+
+The engine evaluates candidates against a rigorous **100-Point Scoring Matrix** tailored specifically for UK International School recruitment standards (such as Harrow International School):
+
+### 📊 Scoring Dimensions (100 Points Total)
+
+| Dimension | Weight | Criteria & Qualification Benchmark |
+| :--- | :---: | :--- |
+| **Mandatory Qualifications & UK Alignment** | **30 pts** | UK Qualified Teacher Status (QTS), Postgraduate Certificate in Education (PGCE), or direct Subject Degree relevance from recognized universities. |
+| **Curriculum & Pedagogical Experience** | **30 pts** | Practical experience teaching National Curriculum for England (NCfE), EYFS, IGCSE, or A-Level, and track record in British/British-international schools. |
+| **Safeguarding & Safer Recruitment Alignment** | **20 pts** | Alignment with Keeping Children Safe in Education (KCSIE), continuous employment history (gap analysis), and safeguarding commitment. |
+| **Whole School & Co-Curricular Contribution** | **20 pts** | Leadership in Co-Curricular Activities (CCA), pastoral care experience, and contribution to holistic school community life. |
+
+### 📈 Tiering Methodology (HR Natural Break Gap Analysis)
+
+Candidates are tiered automatically using HR Natural Break / Gap Analysis rather than static arbitrary cutoffs:
+
+- **🟢 Shortlist (Top Fit, High Priority)**:
+  - Candidates scoring **75+ points** AND within a **12-point gap** of the leading candidate (capped at Top 5 max).
+  - Represents exceptional alignment with mandatory qualifications, curriculum mastery, and safeguarding standards.
+- **🟡 Longlist (Qualified Backup Pool)**:
+  - Candidates scoring **50–74 points** (or scoring 75+ who fall outside the top natural break cluster).
+  - Qualified candidates possessing core competencies but with minor skill gaps or fewer years of British curriculum experience.
+- **🔴 Filtered Out / Rejected (Unmatched Qualifications)**:
+  - Candidates scoring **below 50 points**.
+  - Missing mandatory requirements (e.g. lack of QTS/PGCE, missing core curriculum fit, or severe qualification mismatches).
+
+---
+
+## 📊 4. Output Reports Explanation
 
 Once screening is complete, 3 complementary executive report formats are generated:
 
@@ -59,7 +88,7 @@ Once screening is complete, 3 complementary executive report formats are generat
 
 ---
 
-## 🔑 4. API Key Guide (Google Gemini AI)
+## 🔑 5. API Key Guide (Google Gemini AI)
 
 ### What is an API Key?
 An **API Key** is a secure digital passphrase that allows the Candidate Screening Engine to connect to Google's Gemini AI service to analyze and evaluate candidate resumes.
