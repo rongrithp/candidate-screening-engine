@@ -39,15 +39,22 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
-# API Key Resolution Helper
+# API Key Resolution Helper (Self-Healing)
 # ---------------------------------------------------------------------------
 def resolve_api_key(target_dir: Optional[Path] = None) -> Optional[str]:
-    """Search for GEMINI_API_KEY or GOOGLE_API_KEY in environment or .env files."""
+    """
+    Search for GEMINI_API_KEY or GOOGLE_API_KEY in:
+    1. OS environment variables
+    2. .env files in script directory, target directory (and parents), or current working directory (and parents)
+    3. Interactive prompt fallback with self-healing persistence to .env at script root
+    """
     for env_var in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
         if os.environ.get(env_var):
             return os.environ[env_var]
 
-    search_paths = []
+    script_dir = Path(__file__).resolve().parent
+    search_paths = [script_dir]
+
     if target_dir:
         search_paths.append(target_dir)
         search_paths.extend(target_dir.parents)
@@ -56,17 +63,12 @@ def resolve_api_key(target_dir: Optional[Path] = None) -> Optional[str]:
     search_paths.append(curr)
     search_paths.extend(curr.parents)
 
-    # Check parent kinetics directory if present
-    kinetics_dir = Path(r"g:\My Drive\02. kinetics")
-    if kinetics_dir.exists():
-        search_paths.append(kinetics_dir)
-        for sub in kinetics_dir.iterdir():
-            if sub.is_dir():
-                search_paths.append(sub)
-
     visited = set()
     for p in search_paths:
-        p_resolved = p.resolve()
+        try:
+            p_resolved = p.resolve()
+        except Exception:
+            continue
         if p_resolved in visited:
             continue
         visited.add(p_resolved)
@@ -86,6 +88,26 @@ def resolve_api_key(target_dir: Optional[Path] = None) -> Optional[str]:
                                 return v
                 except Exception:
                     pass
+
+    # API Key Self-Healing Prompt
+    print("\n============================================================")
+    print("🔑 GEMINI_API_KEY / GOOGLE_API_KEY not found in environment or .env file.")
+    print("============================================================")
+    try:
+        user_key = input("Please enter your GEMINI_API_KEY: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        user_key = ""
+
+    if user_key:
+        env_dest = script_dir / ".env"
+        try:
+            env_dest.write_text(f"GEMINI_API_KEY={user_key}\n", encoding="utf-8")
+            print(f"✔ API Key saved to '{env_dest.name}' at script root.")
+        except Exception as e:
+            print(f"  [Warning] Could not persist API key to .env: {e}")
+        os.environ["GEMINI_API_KEY"] = user_key
+        return user_key
+
     return None
 
 
@@ -814,16 +836,22 @@ def export_candidate_summary_docx(target_dir: Path, jd_filename: str, candidates
 
 
 # ---------------------------------------------------------------------------
-# Batch File Template Generator
+# Batch File Template Generator (Dual-Mode EXE/Python)
 # ---------------------------------------------------------------------------
 def ensure_run_screening_bat(target_dir: Path):
-    """Ensure run_screening.bat is present inside target job folder."""
+    """Ensure run_screening.bat is present inside target job folder with dual EXE/Python support."""
     bat_path = target_dir / "run_screening.bat"
     bat_content = (
         "@echo off\n"
         "chcp 65001 > nul\n"
-        "echo Starting Screening Engine...\n"
-        'python "%~dp0..\\screener_core.py" "%~dp0"\n'
+        "echo Starting Candidate Screening Engine...\n\n"
+        'if exist "%~dp0..\\screener_core.exe" (\n'
+        '    "%~dp0..\\screener_core.exe" "%~dp0"\n'
+        ') else if exist "%~dp0..\\screener_core.py" (\n'
+        '    python "%~dp0..\\screener_core.py" "%~dp0"\n'
+        ") else (\n"
+        "    echo Error: Neither screener_core.exe nor screener_core.py was found in parent directory.\n"
+        ")\n"
         "pause\n"
     )
     bat_path.write_text(bat_content, encoding="utf-8")
