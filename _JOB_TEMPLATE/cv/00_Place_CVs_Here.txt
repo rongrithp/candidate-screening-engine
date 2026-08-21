@@ -1,0 +1,1 @@
+﻿Place Candidate CV files (PDF/DOCX/TXT) in this folder.
