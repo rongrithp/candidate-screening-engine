@@ -396,10 +396,42 @@ def find_and_read_candidate_cvs(target_dir: Path) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Gemini AI Evaluation Engine
+# Gemini AI Evaluation Engine & Model Fallback Hierarchy
 # ---------------------------------------------------------------------------
-def evaluate_cv_against_jd(client: genai.Client, jd_text: str, cv_item: Dict[str, Any], jd_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Invoke gemini-2.5-flash with structured JSON response schema, supporting multimodal PDF fallback."""
+DEFAULT_MODEL_FALLBACKS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-flash"
+]
+
+
+def resolve_model_chain() -> List[str]:
+    """
+    Build ordered list of Gemini model names starting with GEMINI_MODEL env var if configured,
+    followed by standard stable flash fallback models.
+    """
+    chain = []
+    custom_model = os.environ.get("GEMINI_MODEL", "").strip()
+    if custom_model:
+        chain.append(custom_model)
+    for model_name in DEFAULT_MODEL_FALLBACKS:
+        if model_name not in chain:
+            chain.append(model_name)
+    return chain
+
+
+def evaluate_cv_against_jd(
+    client: genai.Client,
+    jd_text: str,
+    cv_item: Dict[str, Any],
+    jd_info: Optional[Dict[str, Any]] = None
+) -> tuple[Dict[str, Any], str]:
+    """
+    Invoke Gemini model with structured JSON response schema, supporting multimodal PDF fallback
+    and dynamic model fallback hierarchy (GEMINI_MODEL -> gemini-2.5-flash -> gemini-2.0-flash -> gemini-1.5-flash).
+    Returns tuple: (evaluation_dict, model_used_name)
+    """
     prompt = f"""
 You are an expert Senior HR Recruiter and Talent Acquisition Specialist.
 Evaluate the candidate CV against the target Job Description (JD).
@@ -440,20 +472,34 @@ Evaluate the candidate CV against the target Job Description (JD).
                 types.Part.from_bytes(data=jd_info["raw_bytes"], mime_type="application/pdf")
             )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=CandidateEvaluation,
-            temperature=0.2
-        )
-    )
+    models_to_try = resolve_model_chain()
+    last_exception = None
 
-    result_data = json.loads(response.text)
-    result_data["rel_path"] = cv_item["rel_path"]
-    result_data["filename"] = cv_item["filename"]
-    return result_data
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=CandidateEvaluation,
+                    temperature=0.2
+                )
+            )
+            result_data = json.loads(response.text)
+            result_data["rel_path"] = cv_item["rel_path"]
+            result_data["filename"] = cv_item["filename"]
+            return result_data, model_name
+        except Exception as e:
+            err_msg = str(e)
+            if "401" in err_msg or "UNAUTHENTICATED" in err_msg or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in err_msg:
+                raise e
+            last_exception = e
+            print(f"      ⚠️ Model '{model_name}' unavailable or failed: {e}. Falling back to next model...")
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("All configured Gemini models failed.")
 
 
 # ---------------------------------------------------------------------------
@@ -1030,7 +1076,8 @@ def main():
     print(f"✔ Found {len(cv_items)} Candidate CV(s) in subdirectories.")
     
     # 3. Initialize Gemini GenAI Client
-    print(f"\n🧠 Initializing Gemini GenAI Client (gemini-2.5-flash)...")
+    model_chain = resolve_model_chain()
+    print(f"\n🧠 Initializing Gemini GenAI Client (Model Fallback Chain: {' -> '.join(model_chain)})...")
     try:
         client = genai.Client(api_key=api_key)
     except Exception as e:
@@ -1043,9 +1090,9 @@ def main():
     for idx, cv in enumerate(cv_items, 1):
         print(f"  [{idx}/{len(cv_items)}] Evaluating candidate CV: {cv['rel_path']}...")
         try:
-            eval_data = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
+            eval_data, used_model = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
             evaluations.append(eval_data)
-            print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']}")
+            print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']} (Model: {used_model})")
         except Exception as e:
             err_str = str(e)
             if "401" in err_str or "UNAUTHENTICATED" in err_str or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in err_str:
@@ -1055,9 +1102,9 @@ def main():
                     print("  🔄 Re-initializing Gemini GenAI Client with updated API Key...")
                     try:
                         client = genai.Client(api_key=new_key)
-                        eval_data = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
+                        eval_data, used_model = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
                         evaluations.append(eval_data)
-                        print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']}")
+                        print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']} (Model: {used_model})")
                         continue
                     except Exception as retry_e:
                         print(f"      ❌ Retry failed for {cv['rel_path']}: {retry_e}")
