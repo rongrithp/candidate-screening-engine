@@ -41,79 +41,95 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 # API Key Resolution Helper (Self-Healing)
 # ---------------------------------------------------------------------------
-def resolve_api_key(target_dir: Optional[Path] = None) -> Optional[str]:
+def is_valid_key_format(key: str) -> bool:
+    """Check if string looks like a valid Gemini API Key (not an OAuth token or empty string)."""
+    if not key or not isinstance(key, str):
+        return False
+    k = key.strip()
+    if len(k) < 20:
+        return False
+    if k.startswith("ya29."):  # OAuth access token format - unsupported by Gemini API Key auth
+        return False
+    return True
+
+
+def resolve_api_key(target_dir: Optional[Path] = None, force_reprompt: bool = False) -> Optional[str]:
     """
     Search for GEMINI_API_KEY or GOOGLE_API_KEY in:
     1. OS environment variables
     2. .env files in script directory, target directory (and parents), or current working directory (and parents)
     3. Interactive prompt fallback with self-healing persistence to .env at script root
     """
-    for env_var in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
-        if os.environ.get(env_var):
-            return os.environ[env_var]
-
     if getattr(sys, 'frozen', False):
         script_dir = Path(sys.executable).resolve().parent
     else:
         script_dir = Path(__file__).resolve().parent
-    search_paths = [script_dir]
-    search_paths.extend(script_dir.parents)
-    try:
-        if script_dir.parent.exists():
-            for sib in script_dir.parent.iterdir():
-                if sib.is_dir():
-                    search_paths.append(sib)
-    except Exception:
-        pass
 
-    if target_dir:
-        search_paths.append(target_dir)
-        search_paths.extend(target_dir.parents)
-    
-    curr = Path.cwd().resolve()
-    search_paths.append(curr)
-    search_paths.extend(curr.parents)
+    if not force_reprompt:
+        for env_var in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]:
+            val = os.environ.get(env_var)
+            if val and is_valid_key_format(val):
+                return val
 
-    visited = set()
-    for p in search_paths:
+        search_paths = [script_dir]
+        search_paths.extend(script_dir.parents)
         try:
-            p_resolved = p.resolve()
+            if script_dir.parent.exists():
+                for sib in script_dir.parent.iterdir():
+                    if sib.is_dir():
+                        search_paths.append(sib)
         except Exception:
-            continue
-        if p_resolved in visited:
-            continue
-        visited.add(p_resolved)
-        for env_name in [".env", ".env.local"]:
-            env_file = p_resolved / env_name
-            if env_file.exists():
-                try:
-                    content = env_file.read_text(encoding="utf-8", errors="ignore")
-                    for line in content.splitlines():
-                        line = line.strip()
-                        if "=" in line and not line.startswith("#"):
-                            k, v = line.split("=", 1)
-                            k = k.strip()
-                            v = v.strip().strip('"').strip("'")
-                            if k in ["GEMINI_API_KEY", "GOOGLE_API_KEY"] and v:
-                                os.environ["GEMINI_API_KEY"] = v
-                                return v
-                except Exception:
-                    pass
+            pass
+
+        if target_dir:
+            search_paths.append(target_dir)
+            search_paths.extend(target_dir.parents)
+        
+        curr = Path.cwd().resolve()
+        search_paths.append(curr)
+        search_paths.extend(curr.parents)
+
+        visited = set()
+        for p in search_paths:
+            try:
+                p_resolved = p.resolve()
+            except Exception:
+                continue
+            if p_resolved in visited:
+                continue
+            visited.add(p_resolved)
+            for env_name in [".env", ".env.local"]:
+                env_file = p_resolved / env_name
+                if env_file.exists():
+                    try:
+                        content = env_file.read_text(encoding="utf-8", errors="ignore")
+                        for line in content.splitlines():
+                            line = line.strip()
+                            if "=" in line and not line.startswith("#"):
+                                k, v = line.split("=", 1)
+                                k = k.strip()
+                                v = v.strip().strip('"').strip("'")
+                                if k in ["GEMINI_API_KEY", "GOOGLE_API_KEY"] and is_valid_key_format(v):
+                                    os.environ["GEMINI_API_KEY"] = v
+                                    return v
+                    except Exception:
+                        pass
 
     # API Key Self-Healing Prompt
     print("\n============================================================")
-    print("🔑 GEMINI_API_KEY / GOOGLE_API_KEY not found in environment or .env file.")
+    print("🔑 GEMINI_API_KEY not found or current key is invalid/expired.")
+    print("   Get a free API key at: https://aistudio.google.com/app/apikey")
     print("============================================================")
     try:
-        user_key = input("Please enter your GEMINI_API_KEY: ").strip()
+        user_key = input("Please enter a valid GEMINI_API_KEY: ").strip()
     except (KeyboardInterrupt, EOFError):
         user_key = ""
 
-    if user_key:
+    if user_key and is_valid_key_format(user_key):
         env_dest = script_dir / ".env"
         try:
             env_dest.write_text(f"GEMINI_API_KEY={user_key}\n", encoding="utf-8")
-            print(f"✔ API Key saved to '{env_dest.name}' at script root.")
+            print(f"✔ API Key saved to '{env_dest.name}' at script root: {env_dest}")
         except Exception as e:
             print(f"  [Warning] Could not persist API key to .env: {e}")
         os.environ["GEMINI_API_KEY"] = user_key
@@ -1031,6 +1047,20 @@ def main():
             evaluations.append(eval_data)
             print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']}")
         except Exception as e:
+            err_str = str(e)
+            if "401" in err_str or "UNAUTHENTICATED" in err_str or "ACCESS_TOKEN_TYPE_UNSUPPORTED" in err_str:
+                print(f"\n❌ API Key Authentication Error (401): {e}")
+                new_key = resolve_api_key(target_dir, force_reprompt=True)
+                if new_key:
+                    print("  🔄 Re-initializing Gemini GenAI Client with updated API Key...")
+                    try:
+                        client = genai.Client(api_key=new_key)
+                        eval_data = evaluate_cv_against_jd(client, jd_text, cv, jd_info)
+                        evaluations.append(eval_data)
+                        print(f"      -> {eval_data['candidate_name']}: Score = {eval_data['score']}")
+                        continue
+                    except Exception as retry_e:
+                        print(f"      ❌ Retry failed for {cv['rel_path']}: {retry_e}")
             print(f"      ❌ Evaluation failed for {cv['rel_path']}: {e}")
             
     if not evaluations:
